@@ -8,6 +8,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
+from apscheduler.schedulers.background import BackgroundScheduler
 
 # =========================
 # FASTAPI APP
@@ -26,17 +27,33 @@ EMAIL_PASS = os.getenv("EMAIL_PASS")
 EMAIL_TO = os.getenv("EMAIL_TO")
 
 # =========================
+# SAFE CSV LOADER
+# =========================
+
+def load_csv(filename):
+
+    path = os.path.join(BASE_DIR, filename)
+
+    if not os.path.exists(path):
+        print(f"{filename} not found")
+        return pd.DataFrame()
+
+    df = pd.read_csv(path)
+    df.columns = df.columns.str.strip().str.lower()
+    return df
+
+# =========================
 # LOAD CSV FILES
 # =========================
 
-agreement = pd.read_csv(os.path.join(BASE_DIR, "agreement_details.csv"))
-product = pd.read_csv(os.path.join(BASE_DIR, "product_details.csv"))
-dealer = pd.read_csv(os.path.join(BASE_DIR, "dealer_details.csv"))
-employee = pd.read_csv(os.path.join(BASE_DIR, "employee_details.csv"))
-bounce = pd.read_csv(os.path.join(BASE_DIR, "bounce_details.csv"))
-payment = pd.read_csv(os.path.join(BASE_DIR, "payment_details.csv"))
+agreement = load_csv("agreement_details.csv")
+product = load_csv("product_details.csv")
+dealer = load_csv("dealer_details.csv")
+employee = load_csv("employee_details.csv")
+bounce = load_csv("bounce_details.csv")
+payment = load_csv("payment_details.csv")
 
-print("✓ CSV files loaded")
+print("CSV files loaded")
 
 # =========================
 # REQUEST MODEL
@@ -62,11 +79,35 @@ def safe_merge(left_df, right_df, left_key, right_key):
     )
 
 # =========================
+# ROOT API
+# =========================
+
+@app.get("/")
+def home():
+
+    return {
+        "service": "Loan Risk Monitoring API",
+        "status": "running"
+    }
+
+# =========================
+# HEALTH CHECK
+# =========================
+
+@app.get("/health")
+def health():
+
+    return {"status": "ok"}
+
+# =========================
 # MASTER API
 # =========================
 
 @app.post("/get_master")
 def get_master(query: AgreementQuery):
+
+    if "agreement_no" not in agreement.columns:
+        return {"error": "agreement_no column missing"}
 
     a = agreement[agreement["agreement_no"] == query.agreement_no]
 
@@ -91,6 +132,9 @@ def get_master(query: AgreementQuery):
 @app.post("/get_bounce")
 def get_bounce(query: AgreementQuery):
 
+    if "agreement_no" not in bounce.columns:
+        return {"agreement_no": query.agreement_no, "bounce_count": 0}
+
     count = len(bounce[bounce["agreement_no"] == query.agreement_no])
 
     return {
@@ -105,20 +149,23 @@ def get_bounce(query: AgreementQuery):
 @app.post("/get_dpd")
 def get_dpd(query: AgreementQuery):
 
+    if "agreement_no" not in payment.columns:
+        return {"agreement_no": query.agreement_no, "dpd": 0}
+
     p = payment[payment["agreement_no"] == query.agreement_no]
 
     if p.empty:
-        return {
-            "agreement_no": query.agreement_no,
-            "dpd": 0
-        }
+        return {"agreement_no": query.agreement_no, "dpd": 0}
 
     row = p.iloc[0]
 
-    due = pd.to_datetime(row["due_date"])
-    paid = pd.to_datetime(row["payment_date"])
+    due = pd.to_datetime(row.get("due_date"), errors="coerce")
+    paid = pd.to_datetime(row.get("payment_date"), errors="coerce")
 
-    dpd = (paid - due).days
+    if pd.isna(due) or pd.isna(paid):
+        dpd = 0
+    else:
+        dpd = (paid - due).days
 
     return {
         "agreement_no": query.agreement_no,
@@ -167,7 +214,7 @@ def send_via_gmail(body, csv_path=None):
             server.login(EMAIL_USER, EMAIL_PASS)
             server.send_message(msg)
 
-        print("✓ Email sent")
+        print("Email sent")
 
     except Exception as e:
 
@@ -179,26 +226,34 @@ def send_via_gmail(body, csv_path=None):
 
 def run_risk_analysis():
 
-    print("\nRunning Risk Analysis...")
+    print("Running Risk Analysis...")
 
     results = []
 
-    for idx, ag in enumerate(agreement["agreement_no"], 1):
+    if "agreement_no" not in agreement.columns:
+        return {"error": "agreement_no column missing"}
 
-        bounce_count = len(bounce[bounce["agreement_no"] == ag])
+    for ag in agreement["agreement_no"]:
 
-        p = payment[payment["agreement_no"] == ag]
+        bounce_count = 0
+        dpd = 0
 
-        if p.empty:
-            dpd = 0
-        else:
+        if "agreement_no" in bounce.columns:
+            bounce_count = len(bounce[bounce["agreement_no"] == ag])
 
-            row = p.iloc[0]
+        if "agreement_no" in payment.columns:
 
-            due = pd.to_datetime(row["due_date"])
-            paid = pd.to_datetime(row["payment_date"])
+            p = payment[payment["agreement_no"] == ag]
 
-            dpd = (paid - due).days
+            if not p.empty:
+
+                row = p.iloc[0]
+
+                due = pd.to_datetime(row.get("due_date"), errors="coerce")
+                paid = pd.to_datetime(row.get("payment_date"), errors="coerce")
+
+                if not pd.isna(due) and not pd.isna(paid):
+                    dpd = (paid - due).days
 
         if dpd > 10 or bounce_count >= 2:
 
@@ -217,14 +272,11 @@ def run_risk_analysis():
                 "Action": action
             })
 
-    print("Risky agreements:", len(results))
-
     output_path = os.path.join(BASE_DIR, "daily_risk_output.csv")
 
     if results:
 
         df = pd.DataFrame(results)
-
         df.to_csv(output_path, index=False)
 
         body = f"""Daily Risk Report
@@ -234,24 +286,12 @@ Date: {pd.Timestamp.now()}
 Total Risky Agreements: {len(results)}
 """
 
-        for r in results:
-
-            body += f"""
-Agreement No: {r['agreement_no']}
-DPD: {r['DPD']}
-Bounce Count: {r['Bounce']}
-Risk Level: {r['Risk']}
-Action: {r['Action']}
-"""
-
         send_via_gmail(body, output_path)
 
-    return {
-        "risky_agreements": len(results)
-    }
+    return {"risky_agreements": len(results)}
 
 # =========================
-# API TO RUN RISK ENGINE
+# RUN RISK API
 # =========================
 
 @app.get("/run-risk")
@@ -265,13 +305,20 @@ def trigger_risk():
     }
 
 # =========================
-# ROOT API
+# SCHEDULER (AUTO RUN 11:50 AM)
 # =========================
 
-@app.get("/")
-def home():
+scheduler = BackgroundScheduler()
 
-    return {
-        "service": "Loan Risk Monitoring API",
-        "status": "running"
-    }
+def scheduled_risk_job():
+    print("Scheduled job running (11:50 AM)")
+    run_risk_analysis()
+
+scheduler.add_job(
+    scheduled_risk_job,
+    'cron',
+    hour=11,
+    minute=50
+)
+
+scheduler.start()
